@@ -43,7 +43,19 @@ def _try_numeric(value):
     return None
 
 
-def plot_species_yields(species_csv: str, output_path: str, species: list = None, log_scale: bool = True):
+def plot_species_yields(species_csv: str, output_path: str, species: list = None,
+                         log_scale: bool = True, raw: bool = False):
+    """
+    raw=False (default): plot yield_<species> = n_<species> / n_TMA, as before.
+    raw=True: plot the cumulative distinct-molecule counts (n_<species>, from
+    aggregate_released_species.py's dedup) directly, with no normalization.
+    n_TMA in species_by_condition.csv is itself just another deduplicated
+    cumulative count (distinct TMA-labelled fragments ever seen released/
+    physisorbed) — not a literal "TMA delivered" dose — so raw counts are
+    the more directly interpretable quantity; --raw skips manufacturing a
+    ratio out of two counts that may not mean what "per TMA delivered"
+    implies.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -51,14 +63,21 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
     species = species or DEFAULT_SPECIES
     df = pd.read_csv(species_csv)
 
-    if "n_TMA" not in df.columns:
-        raise ValueError("species_by_condition.csv must include an 'n_TMA' column to normalize yields against.")
-
-    # Compute yields fresh (don't assume the CSV already has yield_ columns)
-    for s in species:
-        col = f"n_{s}"
-        if col in df.columns:
-            df[f"yield_{s}"] = df[col] / df["n_TMA"]
+    if raw:
+        plot_col = "n_{}"
+        y_label = "Molecules produced (cumulative, deduplicated)" + (" [log scale]" if log_scale else "")
+        title = "Byproduct species produced (cumulative counts), across parameter sweep"
+    else:
+        if "n_TMA" not in df.columns:
+            raise ValueError("species_by_condition.csv must include an 'n_TMA' column to normalize yields against.")
+        # Compute yields fresh (don't assume the CSV already has yield_ columns)
+        for s in species:
+            col = f"n_{s}"
+            if col in df.columns:
+                df[f"yield_{s}"] = df[col] / df["n_TMA"]
+        plot_col = "yield_{}"
+        y_label = "Yield (molecules produced per TMA delivered)" + (" [log scale]" if log_scale else "")
+        title = "Byproduct species yield per TMA delivered, across parameter sweep"
 
     groups = df["group"].unique().tolist()
     n_groups = len(groups)
@@ -76,7 +95,7 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
             # show a trend — render as a simple labeled bar per species
             # instead of a line plot with a meaningless numeric x-axis.
             x_pos = np.arange(len(species))
-            heights = [sub[f"yield_{s}"].iloc[0] if f"yield_{s}" in sub.columns else 0 for s in species]
+            heights = [sub[plot_col.format(s)].iloc[0] if plot_col.format(s) in sub.columns else 0 for s in species]
             colors = [SPECIES_COLORS.get(s, None) for s in species]
             ax.bar(x_pos, heights, color=colors)
             ax.set_xticks(x_pos)
@@ -86,7 +105,7 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
             sub = sub.sort_values("numeric_value")
             x = sub["numeric_value"]
             for s in species:
-                ycol = f"yield_{s}"
+                ycol = plot_col.format(s)
                 if ycol in sub.columns:
                     ax.plot(x, sub[ycol], "o-", color=SPECIES_COLORS.get(s, None), label=s, markersize=5)
             ax.set_xlabel(group)
@@ -95,7 +114,7 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
             x_pos = np.arange(len(x_labels))
             width = 0.8 / max(len(species), 1)
             for i, s in enumerate(species):
-                ycol = f"yield_{s}"
+                ycol = plot_col.format(s)
                 if ycol in sub.columns:
                     ax.bar(x_pos + i * width, sub[ycol], width=width, color=SPECIES_COLORS.get(s, None), label=s)
             ax.set_xticks(x_pos + width * (len(species) - 1) / 2)
@@ -107,7 +126,7 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
         ax.set_title(group)
         ax.grid(True, alpha=0.3, which="both")
         if col == 0:
-            ax.set_ylabel("Yield (molecules produced per TMA delivered)" + (" [log scale]" if log_scale else ""))
+            ax.set_ylabel(y_label)
 
     # One shared legend
     handles, labels = axes[0].get_legend_handles_labels()
@@ -119,7 +138,7 @@ def plot_species_yields(species_csv: str, output_path: str, species: list = None
                 break
     fig.legend(handles, labels, loc="lower center", ncol=len(species), bbox_to_anchor=(0.5, -0.05), fontsize=9)
 
-    fig.suptitle("Byproduct species yield per TMA delivered, across parameter sweep", fontsize=13)
+    fig.suptitle(title, fontsize=13)
     fig.tight_layout(rect=[0, 0.06, 1, 0.95])
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -133,6 +152,9 @@ if __name__ == "__main__":
     parser.add_argument("--species", nargs="+", default=None,
                          help=f"Species to plot (default: {DEFAULT_SPECIES})")
     parser.add_argument("--linear", action="store_true", help="Use linear y-axis instead of the log-scale default")
+    parser.add_argument("--raw", action="store_true",
+                         help="Plot cumulative molecule counts directly (n_<species>) instead of "
+                              "normalizing by n_TMA into a 'per TMA delivered' yield ratio.")
     args = parser.parse_args()
 
-    plot_species_yields(args.species_csv, args.output, args.species, log_scale=not args.linear)
+    plot_species_yields(args.species_csv, args.output, args.species, log_scale=not args.linear, raw=args.raw)

@@ -215,6 +215,7 @@ def run(
     density_fraction: float = DEFAULT_DENSITY_FRACTION,
     min_layer_atoms: int = DEFAULT_MIN_LAYER_ATOMS,
     scan_bin_width: float = DEFAULT_SCAN_BIN_WIDTH,
+    site_by_id: dict | None = None,
 ):
     if contact_cutoff <= chem_cutoff:
         raise ValueError(
@@ -292,6 +293,7 @@ def run(
             data_chem, frame, AL_TYPE, CARBON_TYPE, SUBSTRATE_TYPES,
             sz.z_surface, chem_cutoff, contact_cutoff,
             al_c_cutoff=al_c_cutoff, scan_cutoffs=scan_cutoffs,
+            site_by_id=site_by_id,
         )
         for r in al_recs:
             row = {
@@ -300,7 +302,9 @@ def run(
                 "z_surface": round(r.z_surface, 3), "z_rel": round(r.z_rel, 3),
                 "n_C_ligands": r.n_C_ligands, "ligand_state": r.ligand_state,
                 "nearest_substrate_dist": round(r.nearest_substrate_dist, 3) if r.nearest_substrate_dist == r.nearest_substrate_dist else None,
+                "nearest_substrate_id": r.nearest_substrate_id,
                 "binding_state": r.binding_state,
+                "bound_site_type": r.bound_site_type,
             }
             for c, n in r.n_substrate_neighbors.items():
                 row[f"n_sub_within_{c}"] = n
@@ -439,6 +443,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dump",   required=True, help="Path to LAMMPS dump file")
     parser.add_argument("--output", required=True, help="Output CSV path (per-frame state summary)")
+    parser.add_argument("--dump0", default=None,
+                        help="Path to the pristine pre-deposition dump (dump0.lammpstrj). If given, "
+                             "classifies surface O/Si sites (hydroxyl_O/bridging_O/dangling_O/"
+                             "*_Si — see site_classification.py) and tags each chemisorbed/"
+                             "incorporated Al with the site type it bonded to (bound_site_type "
+                             "column). Optional — omit to skip site classification entirely.")
+    parser.add_argument("--si-o-cutoff", type=float, default=2.0,
+                        help="Si-O bonding cutoff for site classification, Å (default: 2.0 — "
+                             "validate against this slab's own Si-O distance histogram before trusting)")
+    parser.add_argument("--o-h-cutoff", type=float, default=1.2,
+                        help="O-H bonding cutoff for site classification, Å (default: 1.2 — "
+                             "validate against this slab's own O-H distance histogram before trusting)")
     parser.add_argument("--chem-cutoff", type=float, default=DEFAULT_CHEM_CUTOFF,
                         help=f"Covalent bonding cutoff, Å (default: {DEFAULT_CHEM_CUTOFF})")
     parser.add_argument("--contact-cutoff", type=float, default=DEFAULT_CONTACT_CUTOFF,
@@ -468,6 +484,22 @@ if __name__ == "__main__":
     if args.scan_cutoffs:
         scan_cutoffs = [float(x) for x in args.scan_cutoffs.split(",")]
 
+    site_by_id = None
+    if args.dump0:
+        from coverage_metrics import classify_initial_sites
+        print(f"\nClassifying surface sites from pristine slab: {args.dump0}")
+        site_by_id, inventory, _ = classify_initial_sites(
+            args.dump0,
+            substrate_types=list(SUBSTRATE_TYPES),
+            slab_thickness=args.slab_thickness,
+            density_fraction=args.density_fraction,
+            min_layer_atoms=args.min_layer_atoms,
+            scan_bin_width=args.scan_bin_width,
+            si_o_cutoff=args.si_o_cutoff,
+            o_h_cutoff=args.o_h_cutoff,
+        )
+        print(f"  Initial site inventory: {inventory}\n")
+
     run(
         dump_path=args.dump,
         output_path=args.output,
@@ -480,4 +512,5 @@ if __name__ == "__main__":
         density_fraction=args.density_fraction,
         min_layer_atoms=args.min_layer_atoms,
         scan_bin_width=args.scan_bin_width,
+        site_by_id=site_by_id,
     )

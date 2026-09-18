@@ -38,6 +38,7 @@ def _parse_dump_header(dump_path: str) -> dict:
     Read the first frame header of a LAMMPS dump file and return:
       - 'scaled': True if coordinates are xs/ys/zs (fractional)
       - 'type_col': 0-based index of the 'type' column in the ATOMS block
+      - 'id_col': 0-based index of the 'id' column, or None if absent
       - 'columns': full list of column names from ITEM: ATOMS
     """
     with open(dump_path) as f:
@@ -47,17 +48,20 @@ def _parse_dump_header(dump_path: str) -> dict:
                 return {
                     "scaled":   any(c in ("xs", "ys", "zs") for c in cols),
                     "type_col": cols.index("type") if "type" in cols else None,
+                    "id_col":   cols.index("id") if "id" in cols else None,
                     "columns":  cols,
                 }
     raise ValueError(f"No 'ITEM: ATOMS' line found in {dump_path}")
 
 
-def _iter_raw_type_arrays(dump_path: str, type_col: int):
+def _iter_raw_column_arrays(dump_path: str, col_indices: dict):
     """
-    Generator yielding one np.ndarray of raw LAMMPS integer types per frame,
-    parsed directly from the dump text (bypasses ASE's atomic-number
-    remapping, where LAMMPS type 4 would otherwise become atomic number 4
-    = Be instead of staying 4).
+    Generator yielding one dict of {name: np.ndarray} per frame, with one
+    entry per (name, col_index) pair in col_indices — parsed directly from
+    the dump text in a single pass, bypassing ASE's atomic-number
+    remapping (where LAMMPS type 4 would otherwise become atomic number 4
+    = Be instead of staying 4). Used for both 'type' and 'id' columns so
+    both can be read together without scanning the file twice.
     """
     with open(dump_path) as f:
         n_atoms = None
@@ -78,9 +82,10 @@ def _iter_raw_type_arrays(dump_path: str, type_col: int):
                 rows = []
                 continue
             if in_atoms and n_atoms is not None:
-                rows.append(int(line.split()[type_col]))
+                parts = line.split()
+                rows.append({name: int(parts[idx]) for name, idx in col_indices.items()})
                 if len(rows) == n_atoms:
-                    yield np.array(rows, dtype=int)
+                    yield {name: np.array([r[name] for r in rows], dtype=int) for name in col_indices}
                     in_atoms = False
                     n_atoms = None
                     rows = []
@@ -99,24 +104,35 @@ def read_lammps_dump_frames(dump_path: str, stride: int = 1):
     - atoms.arrays['type'] holds raw LAMMPS integer type IDs, parsed
       directly from the dump text and injected before yielding, bypassing
       ASE's atomic-number remapping.
+    - atoms.arrays['id'] holds the LAMMPS atom id column, if present in
+      the dump (needed to track a specific atom's identity — e.g. a
+      substrate site's classification — across frames or across dump
+      files, since array index alone isn't stable for that).
     - Cell geometry, box bounds, and PBC flags come from ASE (correct).
     """
     from ase.io import iread
 
     header = _parse_dump_header(dump_path)
     type_col = header["type_col"]
+    id_col = header["id_col"]
     if type_col is None:
         raise ValueError(
             "No 'type' column found in dump ITEM: ATOMS header. "
             f"Columns present: {header['columns']}"
         )
 
-    raw_type_gen = _iter_raw_type_arrays(dump_path, type_col)
+    col_indices = {"type": type_col}
+    if id_col is not None:
+        col_indices["id"] = id_col
+
+    raw_col_gen = _iter_raw_column_arrays(dump_path, col_indices)
 
     for i, atoms in enumerate(iread(dump_path, format="lammps-dump-text", index=":")):
-        raw_types = next(raw_type_gen)
+        raw_cols = next(raw_col_gen)
         if i % stride == 0:
-            atoms.arrays["type"] = raw_types
+            atoms.arrays["type"] = raw_cols["type"]
+            if "id" in raw_cols:
+                atoms.arrays["id"] = raw_cols["id"]
             yield i, atoms
 
 
@@ -131,6 +147,21 @@ def get_lammps_types(atoms) -> np.ndarray:
     raise KeyError(
         "atoms.arrays['type'] not found. Was this frame read by "
         "read_lammps_dump_frames()? Available keys: "
+        f"{list(atoms.arrays.keys())}"
+    )
+
+
+def get_lammps_ids(atoms) -> np.ndarray:
+    """
+    Return the LAMMPS atom id column for every atom, in the same order as
+    positions/types. Requires the dump to have an 'id' column (both
+    dump0.lammpstrj and dump1.lammpstrj do, per in.lammps's dump commands).
+    """
+    if "id" in atoms.arrays:
+        return np.array(atoms.arrays["id"], dtype=int)
+    raise KeyError(
+        "atoms.arrays['id'] not found — no 'id' column in this dump file's "
+        "ITEM: ATOMS header. Available keys: "
         f"{list(atoms.arrays.keys())}"
     )
 

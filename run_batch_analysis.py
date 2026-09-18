@@ -39,7 +39,10 @@ from pathlib import Path
 import pandas as pd
 
 from deposition_analysis import run as run_deposition_analysis
-from coverage_metrics import count_oh_sites, compute_coverage_sticking
+from coverage_metrics import (
+    count_oh_sites, compute_coverage_sticking, tail_average,
+    classify_initial_sites, compute_site_type_coverage,
+)
 from al_c_distance_histogram import collect_al_c_distances, find_bonding_cutoff
 
 
@@ -104,6 +107,10 @@ def run_batch(
     stride: int = 5,
     late_frame_sample_count: int = 5,
     hydroxyl_type: int = 1,
+    avg_window: int = 20,
+    classify_sites: bool = False,
+    si_o_cutoff: float = 2.0,
+    o_h_cutoff: float = 1.2,
 ):
     root_path = Path(root)
     run_dirs = find_run_directories(root)
@@ -119,6 +126,18 @@ def run_batch(
         dump0_path = str(run_dir / "dump0.lammpstrj")
         output_csv = str(run_dir / "analysis.csv")
 
+        # Site classification (opt-in via --classify-sites) — needs to happen
+        # BEFORE the main analysis run so site_by_id can be threaded through
+        # to al_bonding_analysis (bound_site_type column).
+        site_by_id, site_inventory = None, None
+        if classify_sites:
+            try:
+                site_by_id, site_inventory, _ = classify_initial_sites(
+                    dump0_path, si_o_cutoff=si_o_cutoff, o_h_cutoff=o_h_cutoff,
+                )
+            except Exception as e:
+                print(f"  WARNING: site classification failed: {e}")
+
         try:
             df, summary, species_over_time, al_df, al_state_counts = run_deposition_analysis(
                 dump_path=dump1_path,
@@ -127,21 +146,41 @@ def run_batch(
                 contact_cutoff=contact_cutoff,
                 al_c_cutoff=al_c_cutoff,
                 stride=stride,
+                site_by_id=site_by_id,
             )
         except Exception as e:
             print(f"  ERROR running deposition_analysis: {e}")
             summary_rows.append({"group": group, "value": value, "run_dir": str(run_dir), "error": str(e)})
             continue
 
-        # OH site count + coverage/sticking
+        # OH site count + coverage/sticking, averaged over the last avg_window
+        # analysed frames rather than the single final frame — a single
+        # endpoint frame is sensitive to whatever noise it happened to land
+        # on (see the ~10pp control-run spread noted in project learnings).
         try:
             n_oh, sz0 = count_oh_sites(dump0_path, hydroxyl_type=hydroxyl_type)
             cov_df = compute_coverage_sticking(al_df, n_oh)
             cov_df.to_csv(run_dir / "coverage_sticking.csv", index=False)
-            final_cov = cov_df.iloc[-1] if not cov_df.empty else None
+            final_cov = tail_average(
+                cov_df, ["n_bonded", "coverage_pct", "sticking_coefficient"], n_frames=avg_window
+            ) if not cov_df.empty else None
         except Exception as e:
             print(f"  WARNING: coverage/sticking calc failed: {e}")
             n_oh, final_cov = None, None
+
+        # Per-site-type coverage fractions (opt-in) — kept as separate
+        # frac_<site_type> columns rather than one combined number; see
+        # coverage_metrics.compute_site_type_coverage docstring for why.
+        site_type_cov = {}
+        if classify_sites and site_inventory:
+            try:
+                site_cov_df = compute_site_type_coverage(al_df, site_inventory)
+                site_cov_df.to_csv(run_dir / "site_type_coverage.csv", index=False)
+                frac_cols = [c for c in site_cov_df.columns if c.startswith("frac_")]
+                if not site_cov_df.empty and frac_cols:
+                    site_type_cov = tail_average(site_cov_df, frac_cols, n_frames=avg_window)
+            except Exception as e:
+                print(f"  WARNING: per-site-type coverage calc failed: {e}")
 
         # Al-C cutoff stability check on late frames
         try:
@@ -159,16 +198,28 @@ def run_batch(
             "group": group, "value": value, "run_dir": str(run_dir),
             "n_oh_sites_initial": n_oh,
             "final_n_Al_total": int(al_df[al_df["frame"] == al_df["frame"].max()].shape[0]) if not al_df.empty else 0,
-            "final_n_bonded": int(final_cov["n_bonded"]) if final_cov is not None else None,
-            "final_coverage_pct": float(final_cov["coverage_pct"]) if final_cov is not None else None,
-            "final_sticking_coefficient": float(final_cov["sticking_coefficient"]) if final_cov is not None else None,
+            # "final_*" fields are now means over the last avg_window analysed
+            # frames (see tail_average), not a single last-frame value.
+            "avg_window_n_frames": final_cov["n_frames_averaged"] if final_cov is not None else None,
+            "avg_window_frame_range": final_cov["frame_range"] if final_cov is not None else None,
+            "final_n_bonded": final_cov["n_bonded"] if final_cov is not None else None,
+            "final_coverage_pct": final_cov["coverage_pct"] if final_cov is not None else None,
+            "final_coverage_pct_std": final_cov["coverage_pct_std"] if final_cov is not None else None,
+            "final_sticking_coefficient": final_cov["sticking_coefficient"] if final_cov is not None else None,
+            "final_sticking_coefficient_std": final_cov["sticking_coefficient_std"] if final_cov is not None else None,
             "al_c_trough_cutoff": trough["cutoff"] if trough else None,
             "al_c_trough_confidence": trough["confidence"] if trough else None,
             "al_c_trough_min_count": trough["min_count"] if trough else None,
             "al_c_trough_peak_count": trough["peak_count"] if trough else None,
         }
+        if site_inventory:
+            for site_type, n_initial in site_inventory.items():
+                row[f"n_{site_type}_initial"] = n_initial
+                row[f"final_frac_{site_type}"] = site_type_cov.get(f"frac_{site_type}")
         summary_rows.append(row)
-        print(f"  -> coverage={row['final_coverage_pct']}%  sticking={row['final_sticking_coefficient']}  "
+        cov_str = f"{row['final_coverage_pct']:.2f}%" if row['final_coverage_pct'] is not None else "n/a"
+        stick_str = f"{row['final_sticking_coefficient']:.4f}" if row['final_sticking_coefficient'] is not None else "n/a"
+        print(f"  -> coverage={cov_str} (avg over {row['avg_window_n_frames']} frames)  sticking={stick_str}  "
               f"al_c_trough={row['al_c_trough_cutoff']} (confidence={row['al_c_trough_confidence']})\n")
 
     summary_df = pd.DataFrame(summary_rows)
@@ -191,6 +242,19 @@ if __name__ == "__main__":
     parser.add_argument("--late-frame-sample-count", type=int, default=5,
                          help="Number of trailing frames to sample for the Al-C cutoff stability check (default: 5)")
     parser.add_argument("--hydroxyl-type", type=int, default=1)
+    parser.add_argument("--avg-window", type=int, default=20,
+                         help="Number of trailing analysed frames to average coverage/sticking/"
+                              "site-type-coverage over, instead of taking the single final frame "
+                              "(default: 20 analysed frames, i.e. after --stride)")
+    parser.add_argument("--classify-sites", action="store_true",
+                         help="Classify surface O/Si sites (hydroxyl_O/bridging_O/dangling_O/"
+                              "*_Si) from each run's dump0 and compute per-site-type coverage "
+                              "fractions alongside the existing hydroxyl-only coverage_pct. "
+                              "Off by default — opt in once the cutoffs below are validated.")
+    parser.add_argument("--si-o-cutoff", type=float, default=2.0,
+                         help="Si-O bonding cutoff for site classification, Å (default: 2.0)")
+    parser.add_argument("--o-h-cutoff", type=float, default=1.2,
+                         help="O-H bonding cutoff for site classification, Å (default: 1.2)")
     args = parser.parse_args()
 
     run_batch(
@@ -198,5 +262,8 @@ if __name__ == "__main__":
         chem_cutoff=args.chem_cutoff, al_c_cutoff=args.al_c_cutoff,
         contact_cutoff=args.contact_cutoff, stride=args.stride,
         late_frame_sample_count=args.late_frame_sample_count,
+        avg_window=args.avg_window,
+        classify_sites=args.classify_sites,
+        si_o_cutoff=args.si_o_cutoff, o_h_cutoff=args.o_h_cutoff,
         hydroxyl_type=args.hydroxyl_type,
     )

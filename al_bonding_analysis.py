@@ -58,8 +58,16 @@ class AlAtomRecord:
     ligand_state:               str     # 'TMA-like' | 'DMA-like' | 'MMA-like' | 'Al*-bare' | 'unexpected(n)'
 
     nearest_substrate_dist:      float   # min distance to any substrate atom within scan range (NaN if none found)
+    nearest_substrate_id:          int | None  # LAMMPS id of that nearest substrate atom (None if none found)
     n_substrate_neighbors:        dict    # {cutoff: count} for each scanned cutoff — multi-scale coordination
     binding_state:                 str     # 'unbound' | 'physisorbed' | 'chemisorbed' | 'incorporated'
+    bound_site_type:                str | None  # site_classification label of nearest_substrate_id, if
+                                                 # binding_state is chemisorbed/incorporated AND site_by_id
+                                                 # was supplied; else None. Looked up from the PRISTINE
+                                                 # (dump0) site classification, so this answers "what kind
+                                                 # of site did this Al originally react with" even after
+                                                 # the local chemistry there has since changed (e.g. its H
+                                                 # left as CH4) — not "what does this atom look like now".
 
 
 def analyse_al_atoms(
@@ -73,6 +81,7 @@ def analyse_al_atoms(
     contact_cutoff: float,
     al_c_cutoff: float | None = None,
     scan_cutoffs: list[float] | None = None,
+    site_by_id: dict | None = None,
 ) -> list[AlAtomRecord]:
     """
     For every Al atom in this frame, compute local ligand count and
@@ -91,6 +100,13 @@ def analyse_al_atoms(
     scan_cutoffs : list of distances to report substrate-neighbor counts at,
                    for inspecting coordination at multiple scales. Defaults
                    to [2.0, chem_cutoff, 3.0, contact_cutoff].
+    site_by_id : optional {lammps_id: label} from
+                 coverage_metrics.classify_initial_sites (pristine dump0
+                 classification). If given, each chemisorbed/incorporated
+                 Al is tagged with the site type of its nearest substrate
+                 neighbor (bound_site_type). If omitted, bound_site_type
+                 is None for every record — this is purely opt-in and
+                 doesn't change behaviour otherwise.
     """
     if al_c_cutoff is None:
         al_c_cutoff = chem_cutoff
@@ -111,6 +127,7 @@ def analyse_al_atoms(
         pos = positions[idx]
 
         sub_dists = []
+        sub_dist_ids = []   # LAMMPS ids parallel to sub_dists, for nearest-neighbor site lookup
         n_at_cutoff = {c: 0 for c in scan_cutoffs}
         n_c_ligands = 0
 
@@ -119,6 +136,7 @@ def analyse_al_atoms(
             d = neigh.distance
             if ntype in substrate_types:
                 sub_dists.append(d)
+                sub_dist_ids.append(int(ids[neigh.index]))
                 for c in scan_cutoffs:
                     if d <= c:
                         n_at_cutoff[c] += 1
@@ -142,7 +160,13 @@ def analyse_al_atoms(
                 if is_nearest_al:
                     n_c_ligands += 1
 
-        nearest_sub_dist = min(sub_dists) if sub_dists else float("nan")
+        if sub_dists:
+            nearest_i = int(np.argmin(sub_dists))
+            nearest_sub_dist = sub_dists[nearest_i]
+            nearest_sub_id = sub_dist_ids[nearest_i]
+        else:
+            nearest_sub_dist = float("nan")
+            nearest_sub_id = None
 
         # Ligand state from direct C-neighbor count
         ligand_state = {3: "TMA-like", 2: "DMA-like", 1: "MMA-like", 0: "Al*-bare"}.get(
@@ -158,6 +182,14 @@ def analyse_al_atoms(
         else:
             binding_state = "incorporated" if z_rel <= 0 else "chemisorbed"
 
+        bound_site_type = None
+        if site_by_id is not None and binding_state in ("chemisorbed", "incorporated") and nearest_sub_id is not None:
+            # Falls back to None (not KeyError) for a substrate atom outside
+            # the classified surface layer, or outside the pristine dump0
+            # slab entirely (shouldn't happen for substrate atoms, but the
+            # classification is opt-in and shouldn't crash the whole run).
+            bound_site_type = site_by_id.get(nearest_sub_id)
+
         records.append(AlAtomRecord(
             frame=frame_index,
             particle_index=int(idx),
@@ -168,8 +200,10 @@ def analyse_al_atoms(
             n_C_ligands=n_c_ligands,
             ligand_state=ligand_state,
             nearest_substrate_dist=float(nearest_sub_dist),
+            nearest_substrate_id=nearest_sub_id,
             n_substrate_neighbors=dict(n_at_cutoff),
             binding_state=binding_state,
+            bound_site_type=bound_site_type,
         ))
 
     return records
